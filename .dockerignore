@@ -1,0 +1,12 @@
+.git
+logs
+config.json
+cloudflared
+cloudflared.exe
+ngrok
+ngrok.exe
+ngrok.zip
+__pycache__
+*.pyc
+.venv
+venv

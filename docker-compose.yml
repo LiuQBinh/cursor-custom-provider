@@ -1,0 +1,16 @@
+services:
+  cursor-proxy:
+    build: .
+    container_name: cursor-custom-provider
+    ports:
+      - "11235:11235"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
+    environment:
+      PORT: "11235"
+      # LM Studio stays on the Windows host. 127.0.0.1 inside the container is not the host.
+      TARGET_BASE_URL: http://host.docker.internal:1234/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

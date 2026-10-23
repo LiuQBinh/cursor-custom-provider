@@ -1,4 +1,5 @@
 import http.server
+import socket
 import urllib.request
 import urllib.error
 import json
@@ -49,14 +50,21 @@ if os.path.exists(CONFIG_PATH):
 else:
     print("[Info] config.json not found. Default Bynara settings will be used.")
 
-PORT = config.get("port", 8080)
-API_KEY = config.get("api_key", "")
-TARGET_BASE_URL = config.get("target_base_url", "https://router.bynara.id/v1")
-MODEL_PREFIX = config.get("model_prefix", "nry-")
-NGROK_AUTHTOKEN = config.get("ngrok_authtoken", "")
-NGROK_DOMAIN = config.get("ngrok_domain", "")
-PROXY_SECRET = config.get("proxy_secret", "")
-RATE_LIMIT_PER_MIN = int(config.get("rate_limit_per_min", 0))
+def cfg(key, env_name, default=""):
+    """Prefer a non-empty environment variable over config.json."""
+    env_val = os.environ.get(env_name)
+    if env_val not in (None, ""):
+        return env_val
+    return config.get(key, default)
+
+PORT = int(cfg("port", "PORT", 8080))
+API_KEY = cfg("api_key", "API_KEY")
+TARGET_BASE_URL = cfg("target_base_url", "TARGET_BASE_URL", "https://router.bynara.id/v1")
+MODEL_PREFIX = cfg("model_prefix", "MODEL_PREFIX", "nry-")
+NGROK_AUTHTOKEN = cfg("ngrok_authtoken", "NGROK_AUTHTOKEN")
+NGROK_DOMAIN = cfg("ngrok_domain", "NGROK_DOMAIN")
+PROXY_SECRET = cfg("proxy_secret", "PROXY_SECRET")
+RATE_LIMIT_PER_MIN = int(cfg("rate_limit_per_min", "RATE_LIMIT_PER_MIN", 0))
 
 ssh_process = None
 public_url = None
@@ -403,6 +411,85 @@ def start_tunnel():
     t = threading.Thread(target=read_output, daemon=True)
     t.start()
 
+def fold_reasoning_into_content(obj, state):
+    """Copy reasoning tokens into content so Cursor paints them as they arrive.
+
+    <think> tags stay hidden until the closing tag, which is why thinking
+    showed up as one occasional block. Plain content deltas render immediately.
+    """
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        delta = choice.get("delta")
+        message = choice.get("message")
+        target = delta if isinstance(delta, dict) else message if isinstance(message, dict) else None
+        if target is None:
+            continue
+        reasoning = target.pop("reasoning_content", None)
+        if reasoning is None:
+            reasoning = target.pop("reasoning", None)
+        content = target.get("content") or ""
+        pieces = []
+        if reasoning:
+            pieces.append(reasoning)
+            state["saw_reasoning"] = True
+        if content:
+            if state.get("saw_reasoning") and not state.get("separated"):
+                pieces.append("\n\n")
+                state["separated"] = True
+            pieces.append(content)
+        if pieces:
+            target["content"] = "".join(pieces)
+
+
+class ReasoningToThink:
+    """Rewrite an OpenAI SSE stream so thinking tokens are visible to Cursor."""
+
+    def __init__(self):
+        self.buf = b""
+        self.state = {"in_think": False}
+
+    def feed(self, chunk):
+        self.buf += chunk
+        out = bytearray()
+        while True:
+            nl = self.buf.find(b"\n")
+            if nl < 0:
+                break
+            raw = self.buf[:nl]
+            self.buf = self.buf[nl + 1:]
+            ending = b"\r\n" if raw.endswith(b"\r") else b"\n"
+            line = raw[:-1] if raw.endswith(b"\r") else raw
+            out += self._line(line, ending)
+        return bytes(out)
+
+    def finish(self):
+        out = bytearray()
+        if self.buf:
+            out += self._line(self.buf, b"\n")
+            self.buf = b""
+        return bytes(out)
+
+    def _line(self, line, ending):
+        stripped = line.strip()
+        if not stripped:
+            return ending
+        if not stripped.startswith(b"data:"):
+            return line + ending
+        payload = stripped[5:].strip()
+        if payload == b"[DONE]":
+            return line + ending
+        try:
+            obj = json.loads(payload.decode("utf-8"))
+        except Exception:
+            return line + ending
+        if not isinstance(obj, dict):
+            return line + ending
+        fold_reasoning_into_content(obj, self.state)
+        return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + ending
+
+
 def cleanup():
     global ssh_process
     if ssh_process:
@@ -414,10 +501,31 @@ def cleanup():
             ssh_process.kill()
         ui.log_line("Tunnel closed.", "OK")
 
+class ProxyHTTPServer(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        err = sys.exception()
+        if isinstance(err, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            log_to_file(f"[Conn] {client_address[0]} closed the connection")
+            return
+        super().handle_error(request, client_address)
+
+
 class BynaraProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         message = "%s - - [%s] %s" % (self.address_string(), self.log_date_time_string(), format%args)
         log_to_file(message)
+
+    def _write_chunk(self, data):
+        if not data:
+            return
+        self.wfile.write(b"%X\r\n" % len(data))
+        self.wfile.write(data)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    def _end_chunks(self):
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def _send_json_error(self, status, public_message, log_detail=None):
         """Send a generic JSON error to the client; keep details in the log only."""
@@ -531,21 +639,47 @@ class BynaraProxyHandler(http.server.BaseHTTPRequestHandler):
 
             req_start = time.time()
             try:
-                with urllib.request.urlopen(req, timeout=120) as response:
+                with urllib.request.urlopen(req, timeout=600) as response:
+                    self.protocol_version = "HTTP/1.1"
+                    try:
+                        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except Exception:
+                        pass
                     self.send_response(response.status)
                     for header, value in response.getheaders():
-                        if header.lower() in ("content-length", "transfer-encoding"):
+                        if header.lower() in ("content-length", "transfer-encoding", "content-type"):
                             continue
                         self.send_header(header, value)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Transfer-Encoding", "chunked")
                     self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("X-Accel-Buffering", "no")
                     self.end_headers()
 
-                    while True:
-                        chunk = response.read(1024)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                    rewriter = ReasoningToThink() if body.get("stream") else None
+                    if rewriter:
+                        while True:
+                            chunk = response.read(1024)
+                            if not chunk:
+                                break
+                            rewritten = rewriter.feed(chunk)
+                            if rewritten:
+                                self._write_chunk(rewritten)
+                        tail = rewriter.finish()
+                        if tail:
+                            self._write_chunk(tail)
+                        self._end_chunks()
+                    else:
+                        raw = response.read()
+                        try:
+                            obj = json.loads(raw.decode("utf-8"))
+                            fold_reasoning_into_content(obj, {})
+                            raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                        except Exception:
+                            pass
+                        self._write_chunk(raw)
+                        self._end_chunks()
                     duration = time.time() - req_start
                     ui.log_request("POST", self.path, original_model, translated_model, response.status, duration)
                     log_to_file(f"[POST] Streaming success for {translated_model}")
@@ -562,6 +696,8 @@ class BynaraProxyHandler(http.server.BaseHTTPRequestHandler):
                 duration = time.time() - req_start
                 ui.log_request("POST", self.path, original_model, translated_model, e.code, duration)
                 log_to_file(f"[POST] HTTPError {e.code}: {err_data.decode('utf-8', errors='ignore')}")
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                log_to_file(f"[POST] Client closed connection for {translated_model}")
             except Exception as e:
                 duration = time.time() - req_start
                 ui.log_request("POST", self.path, original_model, translated_model, 500, duration)
@@ -585,7 +721,9 @@ def run():
     ], ui.CYAN)
     start_tunnel()
     server_address = ('', PORT)
-    httpd = http.server.HTTPServer(server_address, BynaraProxyHandler)
+    # Threaded: cloudflared holds idle connections open, which blocks the
+    # single-threaded HTTPServer and makes every later request hang.
+    httpd = ProxyHTTPServer(server_address, BynaraProxyHandler)
     ui.log_line(f"Local proxy server started on http://localhost:{PORT}", "OK")
     ui.log_line("Press Ctrl+C to stop the program.", "INFO")
     try:
